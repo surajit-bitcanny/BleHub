@@ -4,15 +4,41 @@
 
 'use strict'
 
-const p = require('./peripheral');
+const p = require('./peripheralNew');
+const uuids = require('./uuids');
 
 p.on('stateChange', (state) => {
     if(state === 'poweredOn') {
-        p.startAdvertising();
+        p.startAdvertising()
+            .then(()=>initValues())
+            .catch((error)=>console.log(error));
     } else {
         p.stopAdvertising();
     }
 });
+
+function initValues(){
+    setRandomConnectionType();
+    setRandomDeviceInfo();
+}
+
+function setRandomConnectionType(){
+    var myArray = ['e','w','c','n'];
+    var item = myArray[(Math.random()*myArray.length)|0];
+    p.setConnType({
+        "ct":item
+    });
+}
+
+function setRandomDeviceInfo() {
+    var myArray = [10,11,12,13,14,15,16];
+    var item = myArray[(Math.random()*myArray.length)|0];
+    var device={};
+    var model = 134+item;
+    model = model.toString() + '-1-1';
+    device[item] = ['lock',model];
+    p.setDevInfo(device);
+}
 
 function bytes(size) {
     var str = '';
@@ -24,28 +50,13 @@ function bytes(size) {
 
 p.on('received', (data) => {
     console.log('\nReceived command:', JSON.stringify(data));
-    p.devInfoChar.setValue({
-        i : '1123456789012345678901234567890123456789012345678'
-    });
 
-    p.devInfoChar.setValue({
-        i : '1234567890-=qwertyuiop[]asdfghjkl;zxcvbnm,./'
-    });
 
-    p.connTypeChar.setValue({
-        i : 'aaaaasssssdddddfffffggggghhhhhhjjjjjkkkkkklllllzzzzzxxxxxcccccvvvvvv'
-    });
+    setRandomConnectionType();
+    setRandomDeviceInfo();
 
-    p.connTypeChar.setValue({
-        i : bytes(1000),
-        done: 'yes'
-    });
+    p.indicate(uuids.DEV_INFO_CHAR);
+    p.indicate(uuids.CONN_TYPE_CHAR);
 
-    p.devInfoChar.setValue({
-        i : '11111222222333334444455555566666677777788888999990000099999888888777776666655555544444333332222211111'
-    });
 
-    p.connTypeChar.setValue({
-        i : 6
-    });
 });

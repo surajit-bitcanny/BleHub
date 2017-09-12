@@ -61,9 +61,9 @@ IndicateCharacteristic.prototype.indicate = function(data) {
 };
 
 IndicateCharacteristic.prototype.setEmitter = function(emitter) {
-    // This emitter will be set to the emitter in peripheral.js so that peripheral.js
+    // This emitter will be set to the emitter in peripheralNew.js so that peripheralNew.js
     // can listen for 'setValue' events and 'onIndicate' events. This is all so that
-    // we can implement an indicate queue in peripheral.js
+    // we can implement an indicate queue in peripheralNew.js
     this._emitter = emitter;
 };
 
