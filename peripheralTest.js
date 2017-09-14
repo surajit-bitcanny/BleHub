@@ -25,7 +25,7 @@ function initValues(){
 function setRandomConnectionType(){
     var myArray = ['e','w','c','n'];
     var item = myArray[(Math.random()*myArray.length)|0];
-    p.setConnType({
+    p.setCharacteristicValue(uuids.CONN_TYPE_CHAR,{
         "ct":item
     });
 }
@@ -37,7 +37,7 @@ function setRandomDeviceInfo() {
     var model = 134+item;
     model = model.toString() + '-1-1';
     device[item] = ['lock',model];
-    p.setDevInfo(device);
+    p.setCharacteristicValue(uuids.DEV_INFO_CHAR,device);
 }
 
 function bytes(size) {

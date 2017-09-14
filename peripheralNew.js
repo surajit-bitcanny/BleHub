@@ -28,9 +28,9 @@
 
 const bleno = require('bleno');
 const uuids = require('./uuids');
-var util = require('util');
 const STATUS = uuids.STATUS;
 const EventEmitter = require('events');
+const Promise = require('bluebird');
 class MyEmitter extends EventEmitter {}
 const myEmitter = new MyEmitter();
 var indicateQ = [];
@@ -39,34 +39,58 @@ const maxQLength = 1000000;
 const chunkSize = 19;
 var state = '';
 var writeValue = '';
-var serviceResetRetries = 3;
+var serviceSetRetries = 3;
 var connType = {};
 var devInfo = {};
+var connected = false;
+const TIMEOUT = 5000;
+var writeTimeoutHandler = null;
 
-class ReadIndicateChar extends bleno.Characteristic {
-    constructor(uuid) {
+class MyChar extends bleno.Characteristic {
+    constructor(uuid, properties) {
         super({
             uuid: uuid,
-            properties: ['read', 'indicate']
+            properties: properties
         });
         this.val = {};
         this.updateValueCallback = null;
         this.readQ = [];
     }
 
+    onWriteRequest(data, offset, withoutResponse, callback) {
+        writeRequestHandler(data, offset, withoutResponse, callback);
+    }
+
     onReadRequest(offset, callback) {
         if (this.readQ.length === 0) {
             let data = new Buffer(JSON.stringify(this.val));
             let length = data.byteLength;
-            if (Math.ceil(length/chunkSize) > maxQLength) myEmitter.emit('error', new Error('Read too big'));
-            for (var start = 0, end = chunkSize; start < length; start += chunkSize, end += chunkSize) {
+
+            if (Math.ceil(length/chunkSize) > maxQLength) {
+                myEmitter.emit('error', new Error('Read too big'));
+            }
+
+            for (let start = 0, end = chunkSize;
+                 start < length;
+                 start += chunkSize, end += chunkSize)
+            {
                 let status = new Buffer(1);
-                status.writeUInt8(STATUS.READ | ((start + chunkSize >= length) ? STATUS.EOT : 0x00));
-                let chunk = Buffer.concat([status, data.slice(start, Math.min(length, end))]);
+
+                status.writeUInt8(
+                    STATUS.READ |
+                    ((start + chunkSize >= length) ? STATUS.EOT : 0x00)
+                );
+
+                let chunk = Buffer.concat([
+                    status,
+                    data.slice(start, Math.min(length, end))
+                ]);
+
                 this.readQ.push(chunk);
             }
         }
-        callback(this.RESULT_SUCCESS, this.readQ.shift());
+
+        callback(bleno.Characteristic.RESULT_SUCCESS, this.readQ.shift());
     }
 
     onSubscribe(maxValueSize, updateValueCallback) {
@@ -78,128 +102,50 @@ class ReadIndicateChar extends bleno.Characteristic {
     };
 
     onIndicate() {
-        outstandingIndications--;
-        if(indicateQ.length > 0) {
-            let obj = indicateQ.shift();
-            obj.characteristic.sendIndication(obj.data, obj.resolve, obj.reject);
-            outstandingIndications++;
-        }
-    };
-
-    indicate(resolve, reject) {
-        let data = Buffer(JSON.stringify(this.val));
-        let length = data.byteLength;
-        if (indicateQ.length + Math.ceil(length/chunkSize) > maxQLength) reject(new Error('Indicate queue full'));
-        for (var start = 0, end = chunkSize; start < length; start += chunkSize, end += chunkSize) {
-            let status = new Buffer(1);
-            let endOfTransmission = (start + chunkSize >= length);
-            status.writeUInt8(STATUS.INDICATE | (endOfTransmission ? STATUS.EOT : 0x00));
-            let chunk = Buffer.concat([status, data.slice(start, Math.min(length, end))]);
-            indicateQ.push({
-                characteristic: this,
-                data: chunk,
-                resolve: endOfTransmission ? resolve : null,
-                reject: reject
-            });
-        }
-        if(outstandingIndications === 0 && indicateQ.length > 0) {
-            let obj = indicateQ.shift();
-            obj.characteristic.sendIndication(obj.data, obj.resolve, obj.reject);
-            outstandingIndications++;
-        }
-    };
-
-    sendIndication(data, resolve, reject) {
-        if (this.updateValueCallback) {
-            setImmediate(() => {
-                this.updateValueCallback(data);
-                if (resolve) resolve();
-            });
-        } else reject(new Error('Indicate failed'));
+        onIndicateHandler();
     };
 
     setValue(obj) {
         this.val = obj;
     };
+
+    getValue() {
+        return this.val;
+    }
 }
 
-const commandChar = new bleno.Characteristic({
-    uuid: uuids.COMMAND_CHAR,
-    properties: ['write'],
-    onWriteRequest: function(data, offset, withoutResponse, callback) {
-        if(data.byteLength > 0) {
-            writeValue += data.toString('utf-8');
-        } else {
-            try {
-                myEmitter.emit('received', JSON.parse(writeValue));
-            } catch(err) {
-                myEmitter.emit('error', new Error(err));
-            }
-            writeValue = '';
-        }
-        callback(this.RESULT_SUCCESS);
-    }
-});
-const connTypeChar = new ReadIndicateChar(uuids.CONN_TYPE_CHAR);
-const devInfoChar = new ReadIndicateChar(uuids.DEV_INFO_CHAR);
+const characteristics = [
+    new MyChar(uuids.COMMAND_CHAR, ['write', 'indicate']),
+    new MyChar(uuids.CONN_TYPE_CHAR, ['read', 'indicate']),
+    new MyChar(uuids.DEV_INFO_CHAR, ['read', 'indicate']),
+    new MyChar(uuids.DEV_STATUS_CHAR, ['read', 'indicate'])
+];
 const services = [
     new bleno.PrimaryService({
-        uuid : uuids.RENTLY_SERVICE,
-        characteristics : [commandChar, connTypeChar, devInfoChar]
+        uuid: uuids.RENTLY_SERVICE,
+        characteristics: characteristics
     })
 ];
 
-bleno.on('stateChange', (blenoState) => {
-    /*
-     bleno states:   'unknown', 'resetting', 'unsupported',
-     'unauthorized', 'poweredOff', 'poweredOn'
-     */
-    state = blenoState;
-    myEmitter.emit('stateChange', state);
-    if (state !== 'poweredOn') {
-        stopAdvertising();
-    }
-});
-
-bleno.on('accept', (clientAddress) => {
-    console.log('\nAccepted connection from address', clientAddress);
-    myEmitter.emit('connect', clientAddress);
-});
-
-bleno.on('disconnect', (clientAddress) => {
-    console.log('\nDisconnected from address', clientAddress);
-    myEmitter.emit('disconnect', clientAddress);
-    //stopAdvertising().then(startAdvertising);
-});
-
-bleno.on('rssiUpdate', (rssi) => {
-    myEmitter.emit('rssiUpdate', rssi);
-});
-
-bleno.on('servicesSetError', (err) => {
-    stopAdvertising();
-    if(serviceResetRetries > 0) {
-        startAdvertising();
-        serviceResetRetries -= 1;
-    } else {
-        myEmitter.emit(new Error(err));
-    }
-});
+bleno.on('stateChange', stateChangeHandler);
+bleno.on('accept', acceptHandler);
+bleno.on('disconnect', disconnectHandler);
+bleno.on('servicesSetError', servicesSetErrorHandler);
 
 function startAdvertising() {
     return new Promise((resolve, reject) => {
         if (state === 'poweredOn') {
             bleno.startAdvertising('Rently', [uuids.RENTLY_SERVICE], (err) => {
-                if(!err) {
+                if (!err) {
                     bleno.setServices(services);
                     console.log('\nAdvertising...');
-                    resolve();
+                    return resolve();
                 } else {
-                    reject(new Error('Failed to start advertising'));
+                    return reject(new Error('Failed to start advertising'));
                 }
             });
         } else {
-            reject(new Error('Not in powered on state'));
+            return reject(new Error('Not in powered on state'));
         }
     });
 
@@ -209,9 +155,16 @@ function stopAdvertising() {
     return new Promise((resolve) => {
         bleno.stopAdvertising(() => {
             console.log('\nAdvertising stopped.');
+            serviceSetRetries = 3;
+
             return resolve();
         });
     });
+}
+
+function disconnect() {
+    bleno.disconnect();
+    return Promise.resolve();
 }
 
 function on(event, callback) {
@@ -220,44 +173,223 @@ function on(event, callback) {
      * 'stateChange', 'connect', 'disconnect', 'received',
      * 'rssiUpdate', 'servicesSetError'
      */
+
     myEmitter.on(event, callback);
+
     return module.exports;
 }
 
 function once(event, callback) {
     myEmitter.once(event, callback);
+
     return module.exports;
 }
 
-function indicate(uuid) {
+function removeAllListeners() {
+    myEmitter.removeAllListeners();
+}
+
+function indicate(uuid, obj) {
     return new Promise((resolve, reject) => {
-        switch(uuid) {
-            case uuids.CONN_TYPE_CHAR:
-                connTypeChar.indicate(resolve, reject);
-                break;
-            case uuids.DEV_INFO_CHAR:
-                devInfoChar.indicate(resolve, reject);
-                break;
-            default:
-                myEmitter.emit('error', new Error('Failed to indicate uuid ' + uuid));
+
+        let characteristic = getCharacteristic(uuid);
+
+        if (!characteristic) {
+            return reject(new Error('Failed to indicate ' + uuid));
+        }
+
+        let data = new Buffer(JSON.stringify(obj ? obj : characteristic.getValue()));
+        let length = data.byteLength;
+
+        if (indicateQ.length + Math.ceil(length/chunkSize) > maxQLength){
+            reject(new Error('Indicate queue full'));
+        }
+
+        for (let start = 0, end = chunkSize;
+             start < length;
+             start += chunkSize, end += chunkSize)
+        {
+            let status = new Buffer(1);
+            let endOfTransmission = (start + chunkSize >= length);
+
+            status.writeUInt8(
+                STATUS.INDICATE |
+                (endOfTransmission ? STATUS.EOT : 0x00)
+            );
+
+            let chunk = Buffer.concat([
+                status,
+                data.slice(start, Math.min(length, end))
+            ]);
+
+            indicateQ.push({
+                characteristic: characteristic,
+                data: chunk,
+                resolve: endOfTransmission ? resolve : null,
+                reject: reject
+            });
+        }
+
+        if(outstandingIndications === 0 && indicateQ.length > 0) {
+            let obj = indicateQ.shift();
+
+            sendIndication(
+                obj.characteristic,
+                obj.data,
+                obj.resolve,
+                obj.reject
+            );
+
+            outstandingIndications++;
         }
     });
 }
 
-function setConnType(obj) {
-    connTypeChar.setValue(obj);
-    connType = obj;
+function setCharacteristicValue(uuid, obj) {
+    let characterisitic = getCharacteristic(uuid);
+
+    if (characterisitic) {
+        characterisitic.setValue(obj);
+    }
 }
 
-function setDevInfo(obj) {
-    devInfoChar.setValue(obj);
-    devInfo = obj;
+function getCharacteristic(uuid) {
+    for (let i = 0; i < characteristics.length; i++) {
+        if (characteristics[i].uuid === uuid) {
+            return characteristics[i];
+        }
+    }
+
+    return null;
+}
+
+function updateRssi() {
+    return new Promise((resolve, reject) => {
+        bleno.updateRssi((err, rssi) => {
+            if (err) {
+                return reject(err);
+            } else {
+                return resolve(rssi);
+            }
+        });
+    });
+}
+
+function stateChangeHandler(blenoState) {
+    /**
+     * bleno states:
+     * 'unknown', 'resetting', 'unsupported',
+     * 'unauthorized', 'poweredOff', 'poweredOn'
+     */
+
+    state = blenoState;
+
+    myEmitter.emit('stateChange', state);
+
+    if (state !== 'poweredOn') {
+        stopAdvertising();
+    }
+}
+
+function acceptHandler(clientAddress) {
+    console.log('\nAccepted connection from address ' + clientAddress);
+    connected = true;
+    myEmitter.emit('connect', clientAddress);
+}
+
+
+function disconnectHandler(clientAddress) {
+    console.log('\nDisconnected from address ' + clientAddress);
+    connected = false;
+    myEmitter.emit('disconnect', clientAddress);
+}
+
+function servicesSetErrorHandler(err) {
+    stopAdvertising();
+
+    if(serviceSetRetries > 0) {
+        startAdvertising();
+        serviceSetRetries -= 1;
+    } else {
+        myEmitter.emit('error', err);
+    }
+}
+
+function writeRequestHandler(data, offset, withoutResponse, callback) {
+    let endOfTransmission = (data.byteLength === 0);
+
+    if (endOfTransmission) {
+        try {
+            if (writeTimeoutHandler) {
+                clearTimeout(writeTimeoutHandler);
+            }
+
+            myEmitter.emit('received', JSON.parse(writeValue));
+
+            indicate(uuids.COMMAND_CHAR, 'ACK');
+        } catch(err) {
+            myEmitter.emit('error', err.message);
+        }
+
+        writeValue = '';
+    } else {
+        if (writeTimeoutHandler) {
+            clearTimeout(writeTimeoutHandler);
+        }
+
+        writeTimeoutHandler = setTimeout(() => {
+            myEmitter.emit('error', 'Write timed out');
+            writeValue = '';
+        }, TIMEOUT);
+
+        writeValue += data.toString('utf-8');
+    }
+
+    callback(bleno.Characteristic.RESULT_SUCCESS);
+}
+
+function isConnected() {
+    return connected;
+}
+
+function onIndicateHandler() {
+    outstandingIndications--;
+
+    if(indicateQ.length > 0) {
+        let obj = indicateQ.shift();
+
+        sendIndication(
+            obj.characteristic,
+            obj.data,
+            obj.resolve,
+            obj.reject
+        );
+
+        outstandingIndications++;
+    }
+}
+
+function sendIndication(characteristic, data, resolve, reject) {
+    if (characteristic.updateValueCallback) {
+        setImmediate(() => {
+            characteristic.updateValueCallback(data);
+
+            if (resolve) {
+                return resolve();
+            }
+        });
+    } else {
+        return reject(new Error('Failed to indicate'));
+    }
 }
 
 module.exports.startAdvertising = startAdvertising;
 module.exports.stopAdvertising = stopAdvertising;
 module.exports.on = on;
 module.exports.once = once;
+module.exports.removeAllListeners = removeAllListeners;
 module.exports.indicate = indicate;
-module.exports.setConnType = setConnType;
-module.exports.setDevInfo = setDevInfo;
+module.exports.updateRssi = updateRssi;
+module.exports.disconnect = disconnect;
+module.exports.isConnected = isConnected;
+module.exports.setCharacteristicValue = setCharacteristicValue;
